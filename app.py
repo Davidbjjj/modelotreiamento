@@ -2,11 +2,23 @@
 Uso: python app.py  ->  http://localhost:8000
 """
 import json
+import logging
+import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 import joblib
 
 from treinar import MODELO, analisar_todas
+
+LOG_ARQUIVO = Path(__file__).with_name("rastreabilidade.log")
+log = logging.getLogger("rastreio")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(message)s")
+for _h in (logging.FileHandler(LOG_ARQUIVO, encoding="utf-8"), logging.StreamHandler()):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
 
 modelo = joblib.load(MODELO)
 
@@ -67,26 +79,53 @@ async function enviar(){
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _iniciar(self, extra=None):
+        """Gera o id de rastreio da request e registra a entrada."""
+        self._rid = uuid.uuid4().hex[:12]
+        self._inicio = time.perf_counter()
+        log.info("REQUEST  %s", json.dumps({
+            "id": self._rid, "metodo": self.command, "path": self.path,
+            "cliente": self.client_address[0], **(extra or {}),
+        }, ensure_ascii=False))
+
     def _enviar(self, codigo, tipo, corpo):
         self.send_response(codigo)
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("X-Request-Id", self._rid)
         self.end_headers()
         self.wfile.write(corpo)
+        registro = {
+            "id": self._rid, "status": codigo, "bytes": len(corpo),
+            "duracao_ms": round((time.perf_counter() - self._inicio) * 1000, 1),
+        }
+        if tipo.startswith("application/json"):
+            registro["corpo"] = corpo.decode("utf-8")
+        log.info("RESPONSE %s", json.dumps(registro, ensure_ascii=False))
 
     def do_GET(self):
+        self._iniciar()
         self._enviar(200, "text/html; charset=utf-8", PAGINA.encode("utf-8"))
 
     def do_POST(self):
+        tamanho = int(self.headers.get("Content-Length", 0))
+        bruto = self.rfile.read(tamanho)
+        self._iniciar({"bytes": tamanho, "corpo": bruto.decode("utf-8", "replace")})
         if self.path != "/analisar":
             return self._enviar(404, "text/plain", b"nao encontrado")
-        tamanho = int(self.headers.get("Content-Length", 0))
-        texto = json.loads(self.rfile.read(tamanho)).get("texto", "")
-        resultado = analisar_todas(texto, modelo)
+        try:
+            texto = json.loads(bruto).get("texto", "")
+            resultado = analisar_todas(texto, modelo)
+        except Exception:
+            log.exception("ERRO     id=%s", self._rid)
+            return self._enviar(500, "text/plain", b"erro interno")
         self._enviar(200, "application/json; charset=utf-8",
                      json.dumps(resultado, ensure_ascii=False).encode("utf-8"))
 
+    def log_message(self, format, *args):
+        pass  # substituído pelo log de rastreabilidade
+
 
 if __name__ == "__main__":
-    print("Abra http://localhost:8000")
-    HTTPServer(("127.0.0.1", 8000), Handler).serve_forever()
+    print("Abra http://localhost:8001")
+    HTTPServer(("127.0.0.1", 8001), Handler).serve_forever()
